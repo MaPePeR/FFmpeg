@@ -25,6 +25,7 @@
 
 #include "libavutil/opt.h"
 #include "libavutil/timestamp.h"
+#include "libavutil/audio_fifo.h"
 #include "audio.h"
 #include "formats.h"
 #include "avfilter.h"
@@ -35,7 +36,10 @@ enum SilenceMode {
     SILENCE_TRIM_FLUSH,
     SILENCE_COPY,
     SILENCE_COPY_FLUSH,
-    SILENCE_STOP
+    SILENCE_STOP,
+    SILENCETRIM_START,
+    SILENCETRIM_COPY,
+    SILENCETRIM_BUFFER,
 };
 
 typedef struct SilenceRemoveContext {
@@ -75,6 +79,8 @@ typedef struct SilenceRemoveContext {
     int detection;
     void (*update)(struct SilenceRemoveContext *s, double sample);
     double(*compute)(struct SilenceRemoveContext *s, double sample);
+
+    AVAudioFifo *fifo;
 } SilenceRemoveContext;
 
 #define OFFSET(x) offsetof(SilenceRemoveContext, x)
@@ -543,4 +549,215 @@ AVFilter ff_af_silenceremove = {
     .query_formats = query_formats,
     .inputs        = silenceremove_inputs,
     .outputs       = silenceremove_outputs,
+};
+
+
+
+
+static const AVOption silencetrim_options[] = {
+    { "start_threshold", NULL, OFFSET(start_threshold), AV_OPT_TYPE_DOUBLE,   {.dbl=0},     0, DBL_MAX, FLAGS },
+    { "stop_threshold",  NULL, OFFSET(stop_threshold),  AV_OPT_TYPE_DOUBLE,   {.dbl=0},     0, DBL_MAX, FLAGS },
+    { "detection",       NULL, OFFSET(detection),       AV_OPT_TYPE_INT,      {.i64=1},     0,       1, FLAGS, "detection" },
+    {   "peak",          0,    0,                       AV_OPT_TYPE_CONST,    {.i64=0},     0,       0, FLAGS, "detection" },
+    {   "rms",           0,    0,                       AV_OPT_TYPE_CONST,    {.i64=1},     0,       0, FLAGS, "detection" },
+    { "window",          NULL, OFFSET(window_ratio),    AV_OPT_TYPE_DOUBLE,   {.dbl=0.02},  0,      10, FLAGS },
+    { NULL }
+};
+
+AVFILTER_DEFINE_CLASS(silencetrim);
+
+
+static int trim_config_input(AVFilterLink *inlink)
+{
+    AVFilterContext *ctx = inlink->dst;
+    SilenceRemoveContext *s = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
+
+    s->window_size = FFMAX((inlink->sample_rate * s->window_ratio), 1) * inlink->channels;
+    s->window = av_malloc_array(s->window_size, sizeof(*s->window));
+    if (!s->window)
+        return AVERROR(ENOMEM);
+
+    clear_window(s);
+
+    s->mode = SILENCETRIM_START;
+    s->fifo = av_audio_fifo_alloc(outlink->format, outlink->channels, inlink->sample_rate * 4);
+    if (!s->fifo) {
+        return AVERROR(ENOMEM);
+    }
+
+    return 0;
+}
+
+static int filter_subframe(AVFilterLink *inlink, AVFrame *in, int start_index, int end_index) {
+    AVFilterContext *ctx = inlink->dst;
+    AVFilterLink *outlink = ctx->outputs[0];
+    SilenceRemoveContext *s = ctx->priv;
+    AVFrame *out = ff_get_audio_buffer(outlink, end_index - start_index + 1);
+    if (!out) {
+        return AVERROR(ENOMEM);
+    }
+
+    memcpy(out->data[0], in->data[0] + start_index * inlink->channels * sizeof(double), out->nb_samples * inlink->channels * sizeof(double));
+    out->pts = s->next_pts;
+    s->next_pts += av_rescale_q(out->nb_samples,
+                    (AVRational){1, outlink->sample_rate},
+                    outlink->time_base);
+    return ff_filter_frame(outlink, out);
+}
+
+static void buffer_frame_end(AVFilterLink *inlink, AVFrame *in, int start_index) {
+    AVFilterContext *ctx = inlink->dst;
+    SilenceRemoveContext *s = ctx->priv;
+    int out_samples = in->nb_samples - start_index;
+    double *sub_frame_data = (double*)in->data[0] + start_index * inlink ->channels;
+    av_audio_fifo_write(s->fifo, (void**)&sub_frame_data, out_samples);
+}
+
+static int trim_filter_frame(AVFilterLink *inlink, AVFrame *in)
+{
+    AVFilterContext *ctx = inlink->dst;
+    AVFilterLink *outlink = ctx->outputs[0];
+    SilenceRemoveContext *s = ctx->priv;
+    double *ibuf = (double *)in->data[0];
+    int i, j;
+    int above_start_threshold;
+    int above_stop_threshold;
+    double sample_volume;
+    int first_non_silence_sample_in_frame = -1;
+    int last_non_silence_sample_in_frame = -1;
+    int ret;
+    AVFrame *out;
+
+    for (i = 0;i < in->nb_samples; i++) {
+        above_start_threshold = 0;
+        above_stop_threshold = 0;
+        for (j = 0; j < inlink->channels; j++) {
+            sample_volume = s->compute(s, ibuf[i * inlink->channels + j]);
+            //sample_volume might be NaN, but we want to get a false for this case anyway. (So NaN = assume silence)
+            above_start_threshold |= sample_volume > s->start_threshold;
+            above_stop_threshold  |= sample_volume > s->stop_threshold;
+        }
+        if (above_start_threshold && first_non_silence_sample_in_frame == -1) {
+            first_non_silence_sample_in_frame = i;
+            last_non_silence_sample_in_frame = i;
+        }
+        if (above_stop_threshold) {
+            last_non_silence_sample_in_frame = i;
+        }
+        for (j = 0; j < inlink->channels; j++) {
+            s->update(s, ibuf[i * inlink->channels + j]);
+        }
+
+    }
+    if (s->mode == SILENCETRIM_START) {
+        //We were trimming silence from the start of the audio stream
+        if (first_non_silence_sample_in_frame != -1) {
+            //The audio started playing in this frame
+            //At this point we discard the data that was used to calculate the window.
+            ret = filter_subframe(inlink, in, first_non_silence_sample_in_frame, last_non_silence_sample_in_frame);
+            if (ret < 0) {
+                return ret;
+            }
+
+            if (last_non_silence_sample_in_frame < in->nb_samples - 1) {
+                //Silence also started in this frame: Buffer remaining samples
+                buffer_frame_end(inlink, in, last_non_silence_sample_in_frame + 1);
+
+                s->mode = SILENCETRIM_BUFFER;
+            } else {
+                s->mode = SILENCETRIM_COPY;
+            }
+        }
+    } else if (s->mode == SILENCETRIM_COPY) {
+        //We are currently copying data, so we need to generate a frame with all unwritten data.
+        //Generate Frame from 0 to last_non_silence_sample_in_frame(Might be the whole frame)
+        assert(last_non_silence_sample_in_frame >= 0);
+        ret = filter_subframe(inlink, in, 0, last_non_silence_sample_in_frame);
+        if (ret < 0) {
+            return ret;
+        }
+        if (last_non_silence_sample_in_frame < in->nb_samples - 1) {
+            //Silence also started in this frame: Buffer remaining samples
+            buffer_frame_end(inlink, in, last_non_silence_sample_in_frame + 1);
+
+            s->mode = SILENCETRIM_BUFFER;
+        }
+    } else if (s->mode == SILENCETRIM_BUFFER) {
+        //We are currently buffering silence, that might be the end of all audio.
+        if (first_non_silence_sample_in_frame != -1) {
+            //Silence ended in this frame, so buffered silence should not be trimmed.
+            //Generate Frame from buffer + frame from 0 to last_non_silence_sample_in_frame
+            if (av_audio_fifo_size(s->fifo) > 0) {
+                out = ff_get_audio_buffer(outlink, av_audio_fifo_size(s->fifo));
+                if (!out) {
+                    return AVERROR(ENOMEM);
+                }
+                av_audio_fifo_read(s->fifo, (void**)out->extended_data, out->nb_samples);
+
+                out->pts = s->next_pts;
+                s->next_pts += av_rescale_q(out->nb_samples,
+                    (AVRational){1, outlink->sample_rate},
+                    outlink->time_base);
+                ret = ff_filter_frame(outlink, out);
+                if (ret < 0) {
+                    return ret;
+                }
+            }
+            ret = filter_subframe(inlink, in, 0, last_non_silence_sample_in_frame);
+            if (ret < 0) {
+                return ret;
+            }
+
+            if (last_non_silence_sample_in_frame < in->nb_samples - 1) {
+                buffer_frame_end(inlink, in, last_non_silence_sample_in_frame + 1);
+
+                s->mode = SILENCETRIM_BUFFER;
+            } else {
+                s->mode = SILENCETRIM_COPY;
+            }
+        } else {
+            //Silence did not end in this frame: Buffer the whole frame
+            av_audio_fifo_write(s->fifo, (void**)in->data, in->nb_samples);
+        }
+    }
+
+    av_frame_free(&in);
+    return 0;
+}
+
+static av_cold void trim_uninit(AVFilterContext *ctx)
+{
+    SilenceRemoveContext *s = ctx->priv;
+    av_audio_fifo_free(s->fifo);
+}
+
+static const AVFilterPad silencetrim_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_AUDIO,
+        .config_props = trim_config_input,
+        .filter_frame = trim_filter_frame,
+    },
+    { NULL }
+};
+
+static const AVFilterPad silencetrim_outputs[] = {
+    {
+        .name          = "default",
+        .type          = AVMEDIA_TYPE_AUDIO,
+    },
+    { NULL }
+};
+
+AVFilter ff_af_silencetrim = {
+    .name          = "silencetrim",
+    .description   = NULL_IF_CONFIG_SMALL("Trim silence from start and end of audio."),
+    .priv_size     = sizeof(SilenceRemoveContext),
+    .priv_class    = &silenceremove_class,
+    .init          = init,
+    .uninit        = trim_uninit,
+    .query_formats = query_formats,
+    .inputs        = silencetrim_inputs,
+    .outputs       = silencetrim_outputs,
 };

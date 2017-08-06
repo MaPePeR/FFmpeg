@@ -119,6 +119,7 @@ static void register_all(void)
     REGISTER_FILTER(SIDECHAINGATE,  sidechaingate,  af);
     REGISTER_FILTER(SILENCEDETECT,  silencedetect,  af);
     REGISTER_FILTER(SILENCEREMOVE,  silenceremove,  af);
+    REGISTER_FILTER(SILENCETRIM,    silencetrim,    af);
     REGISTER_FILTER(SOFALIZER,      sofalizer,      af);
     REGISTER_FILTER(STEREOTOOLS,    stereotools,    af);
     REGISTER_FILTER(STEREOWIDEN,    stereowiden,    af);
